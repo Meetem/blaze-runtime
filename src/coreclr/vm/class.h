@@ -340,6 +340,7 @@ class EEClassLayoutInfo
        BYTE packingSize,            // packing size (from @dll.struct)
        BYTE nlType,                 // nltype (from @dll.struct)
        BOOL fExplicitOffsets,       // explicit offsets?
+       BOOL fExplicitSequential,       // explicit Sequential layout for class/struct?
        MethodTable *pParentMT,       // the loaded superclass
        ULONG cTotalFields,              // total number of fields (instance and static)
        HENUMInternal *phEnumField,  // enumerator for fields

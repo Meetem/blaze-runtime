@@ -26,6 +26,21 @@ class MethodTable;
 //=======================================================================
 #define DEFAULT_PACKING_SIZE 64
 
+/*
+    This will only disqualify a class/structure from ManagedSequential when
+    it doesn't have explicitly set Sequential layout, and have GC-fields
+*/
+#define ALLOW_GC_FIELDS_IN_SEQUENTIAL
+
+/*
+    This will never disqualify a class/structure from ManagedSequential 
+*/
+#define ALLOW_GC_FIELDS_IN_AUTO
+
+#if defined(ALLOW_GC_FIELDS_IN_AUTO) && !defined(ALLOW_GC_FIELDS_IN_SEQUENTIAL)
+#error ALLOW_GC_FIELDS_IN_AUTO should only be set when ALLOW_GC_FIELDS_IN_SEQUENTIAL is also set.
+#endif
+
 //=======================================================================
 // This structure contains information about where a field is placed in a structure, as well as it's size and alignment.
 // It is used as part of type-loading to determine native layout and (where applicable) managed sequential layout.

@@ -1756,28 +1756,52 @@ MethodTableBuilder::BuildMethodTableThrowing(
             "Placing %d statics (%d handles) for class %s.\n",
             GetNumStaticFields(), GetNumHandleRegularStatics() + GetNumHandleThreadStatics(),
             pszDebugName));
-
+    
     if (IsBlittable() || IsManagedSequential())
     {
-        bmtFP->NumGCPointerSeries = 0;
-        bmtFP->NumInstanceGCPointerFields = 0;
+        DWORD numGcFields = bmtFP->NumInstanceGCPointerFields;
 
-        _ASSERTE(HasLayout());
+        BOOL shouldSetupGcFields = FALSE;
 
-        if (bmtFP->NumInlineArrayElements != 0)
-        {
-            GetLayoutInfo()->m_cbManagedSize *= bmtFP->NumInlineArrayElements;
-        }
+        #if defined(ALLOW_GC_FIELDS_IN_SEQUENTIAL)
+            shouldSetupGcFields = !IsBlittable();
+        #endif
 
-        bmtFP->NumInstanceFieldBytes = GetLayoutInfo()->m_cbManagedSize;
+        if(shouldSetupGcFields){
+            _ASSERTE(HasLayout());
+            PlaceInstanceFieldsSequential(pByValueClassCache);
+            bmtFP->NumInstanceFieldBytes = GetLayoutInfo()->m_cbManagedSize;
 
-        // For simple Blittable types we still need to check if they have any overlapping
-        // fields and call the method SetHasOverlaidFields() when they are detected.
-        //
-        if (HasExplicitFieldOffsetLayout())
-        {
-            _ASSERTE(!bmtGenerics->fContainsGenericVariables);   // A simple Blittable type can't ever be an open generic type.
-            HandleExplicitLayout(pByValueClassCache);
+            // For simple Blittable types we still need to check if they have any overlapping
+            // fields and call the method SetHasOverlaidFields() when they are detected.
+            //
+            if (HasExplicitFieldOffsetLayout())
+            {
+                printf("Handling explicit layout????\n");
+                _ASSERTE(!bmtGenerics->fContainsGenericVariables);   // A simple Blittable type can't ever be an open generic type.
+                HandleExplicitLayout(pByValueClassCache);
+            }
+        }else{
+            bmtFP->NumGCPointerSeries = 0;
+            bmtFP->NumInstanceGCPointerFields = 0;
+
+            _ASSERTE(HasLayout());
+
+            if (bmtFP->NumInlineArrayElements != 0)
+            {
+                GetLayoutInfo()->m_cbManagedSize *= bmtFP->NumInlineArrayElements;
+            }
+
+            bmtFP->NumInstanceFieldBytes = GetLayoutInfo()->m_cbManagedSize;
+
+            // For simple Blittable types we still need to check if they have any overlapping
+            // fields and call the method SetHasOverlaidFields() when they are detected.
+            //
+            if (HasExplicitFieldOffsetLayout())
+            {
+                _ASSERTE(!bmtGenerics->fContainsGenericVariables);   // A simple Blittable type can't ever be an open generic type.
+                HandleExplicitLayout(pByValueClassCache);
+            }
         }
     }
     else
@@ -1796,6 +1820,8 @@ MethodTableBuilder::BuildMethodTableThrowing(
         }
         else
         {
+            DWORD wasBefore = bmtFP->NumInstanceGCPointerFields;
+
             // Place instance fields
             PlaceInstanceFields(pByValueClassCache);
         }
@@ -1874,6 +1900,10 @@ MethodTableBuilder::BuildMethodTableThrowing(
     if (HasExplicitFieldOffsetLayout())
         // Perform relevant GC calculations for tdexplicit
         HandleGCForExplicitLayout();
+    #if defined(ALLOW_GC_FIELDS_IN_SEQUENTIAL)
+        else if(!IsBlittable() && IsManagedSequential())
+            HandleGCForSequentialLayout(pByValueClassCache);
+    #endif
     else
         // Perform relevant GC calculations for value classes
         HandleGCForValueClasses(pByValueClassCache);
@@ -8450,6 +8480,142 @@ VOID    MethodTableBuilder::PlaceInstanceFields(MethodTable ** pByValueClassCach
 }
 
 //*******************************************************************************
+//
+// Used by BuildMethodTable
+//
+// Place instance fields
+//
+
+struct FieldGcInfo {
+    uint32_t pos;
+    uint32_t size;
+};
+
+VOID    MethodTableBuilder::PlaceInstanceFieldsSequential(MethodTable ** pByValueClassCache)
+{
+    STANDARD_VM_CONTRACT;
+
+    DWORD parentGcSeries = 0;
+    DWORD dwCumulativeInstanceFieldPos = 0;
+
+    // Instance fields start right after the parent
+    if (HasParent())
+    {
+        MethodTable* pParentMT = GetParentMethodTable();
+        if (!(pParentMT->HasLayout() && pParentMT->GetLayoutInfo()->IsZeroSized()))
+            dwCumulativeInstanceFieldPos = pParentMT->GetNumInstanceFieldBytes();
+
+        parentGcSeries = bmtParent->NumParentPointerSeries;
+    }
+
+    dwCumulativeInstanceFieldPos = AlignUp(dwCumulativeInstanceFieldPos, TARGET_POINTER_SIZE);
+
+    LPCUTF8 pszDebugName,pszDebugNamespace;
+    if (FAILED(bmtInternal->pModule->GetMDImport()->GetNameOfTypeDef(bmtInternal->pType->GetTypeDefToken(), &pszDebugName, &pszDebugNamespace)))
+        pszDebugName = pszDebugNamespace = "Invalid TypeDef record";
+    
+    //BOOL isCurrentPointer = FALSE;
+    FieldDesc *pFieldDescList = GetHalfBakedClass()->GetFieldDescList();
+
+    const int MaxGcInfos = 2048;
+    FieldGcInfo *staticGcInfos = (FieldGcInfo*)malloc(sizeof(FieldGcInfo) * 2048);
+    memset(staticGcInfos, 0, sizeof(FieldGcInfo) * 2048);
+
+    DWORD prevEndPos = UINT_MAX;
+    int newGcFieldsCount = -1;
+
+    // Recursively populate fields
+    DWORD baseSize = GetLayoutInfo()->m_cbManagedSize;
+    DWORD numInlineElements = bmtFP->NumInlineArrayElements;
+
+    for(DWORD elementId = 0; elementId < max(numInlineElements, 1); elementId++)
+    {
+        DWORD globalOffset = elementId * baseSize;
+        for(DWORD i = 0;i<bmtEnumFields->dwNumInstanceFields;i++)
+        {
+            auto &instanceField = pFieldDescList[i];
+            auto fldType = instanceField.GetFieldType();
+            _ASSERTE(newGcFieldsCount < MaxGcInfos);
+
+            if(fldType == ELEMENT_TYPE_CLASS)
+            {
+                auto offset = instanceField.GetOffset() + globalOffset;
+                if(prevEndPos != offset){
+                    newGcFieldsCount++;
+                    staticGcInfos[newGcFieldsCount].pos = offset;
+                    staticGcInfos[newGcFieldsCount].size = TARGET_POINTER_SIZE;
+                    prevEndPos = offset + TARGET_POINTER_SIZE;
+                }else{
+                    staticGcInfos[newGcFieldsCount].size += TARGET_POINTER_SIZE;
+                    prevEndPos += TARGET_POINTER_SIZE;
+                }
+            }
+            else if(fldType == ELEMENT_TYPE_VALUETYPE)
+            {
+                MethodTable *fldTypeTable = pByValueClassCache[i];
+                if(!fldTypeTable->ContainsPointers())
+                    continue;
+
+                auto offset = instanceField.GetOffset() + globalOffset;
+                auto gcDescription = CGCDesc::GetCGCDescFromMT(fldTypeTable);
+                auto pGcCurrent = gcDescription->GetLowestSeries();
+                auto highest = gcDescription->GetHighestSeries();
+
+                while(pGcCurrent <= highest){
+                    newGcFieldsCount++;
+                    staticGcInfos[newGcFieldsCount].pos = (uint32_t)(pGcCurrent->startoffset + offset - OBJECT_SIZE - dwCumulativeInstanceFieldPos);
+                    staticGcInfos[newGcFieldsCount].size = (uint32_t)(pGcCurrent->seriessize + fldTypeTable->GetBaseSize());
+                    pGcCurrent++;
+                }
+            }
+        }
+    }
+
+    newGcFieldsCount++;
+
+    // Update managed size
+    if(numInlineElements > 0)
+        GetLayoutInfo()->m_cbManagedSize *= numInlineElements;
+
+    if(newGcFieldsCount == 0){
+        bmtGCSeries->numSeries = 0;
+        bmtFP->NumInstanceGCPointerFields = 0;
+        bmtFP->NumGCPointerSeries = parentGcSeries;
+        free(staticGcInfos);
+        return;
+    }
+
+    /*
+    printf("NumGC Pointers in fields: %d series (%d) (name: %s::%s) (occupying %d bytes)\n",
+        bmtFP->NumInstanceGCPointerFields,
+        bmtFP->NumGCPointerSeries,
+        pszDebugNamespace,
+        pszDebugName,
+        GetLayoutInfo()->m_cbManagedSize
+    );
+    */
+
+    // Worst case scenario
+    bmtGCSeries->pSeries = new bmtGCSeriesInfo::Series[newGcFieldsCount];
+    
+    for(int i = 0; i < newGcFieldsCount; i++){
+        auto &field = staticGcInfos[i];
+        bmtGCSeries->pSeries[i].offset = field.pos - dwCumulativeInstanceFieldPos;
+        bmtGCSeries->pSeries[i].len = field.size;// TARGET_POINTER_SIZE;
+
+        if(bmtGCSeries->pSeries[i].len == 0){
+            newGcFieldsCount = i + 1;
+            break;
+        }
+    }
+
+    bmtGCSeries->numSeries = newGcFieldsCount;
+    //bmtFP->NumInstanceGCPointerFields = newGcFieldsCount;
+    bmtFP->NumGCPointerSeries = parentGcSeries + newGcFieldsCount;
+    free(staticGcInfos);
+    return;
+}
+//*******************************************************************************
 // this accesses the field size which is temporarily stored in m_pMTOfEnclosingClass
 // during class loading. Don't use any other time
 DWORD MethodTableBuilder::GetFieldSize(FieldDesc *pFD)
@@ -9104,7 +9270,7 @@ MethodTableBuilder::HandleGCForExplicitLayout()
     STANDARD_VM_CONTRACT;
 
     MethodTable *pMT = GetHalfBakedMethodTable();
-
+    
     if (bmtFP->NumGCPointerSeries != 0)
     {
         pMT->SetContainsPointers();
@@ -9147,6 +9313,83 @@ MethodTableBuilder::HandleGCForExplicitLayout()
     delete [] bmtGCSeries->pSeries;
     bmtGCSeries->pSeries = NULL;
 } // MethodTableBuilder::HandleGCForExplicitLayout
+
+//*******************************************************************************
+VOID
+MethodTableBuilder::HandleGCForSequentialLayout(MethodTable** pByValueClassCache)
+{
+    STANDARD_VM_CONTRACT;
+
+    MethodTable *pMT = GetHalfBakedMethodTable();
+    
+    LPCUTF8 pszDebugName,pszDebugNamespace;
+    if (FAILED(bmtInternal->pModule->GetMDImport()->GetNameOfTypeDef(bmtInternal->pType->GetTypeDefToken(), &pszDebugName, &pszDebugNamespace)))
+        pszDebugName = pszDebugNamespace = "Invalid TypeDef record";
+
+    BOOL shouldDebug = TRUE;//strcmp(pszDebugNamespace, "UnityEngine") == 0;
+
+    if (bmtFP->NumGCPointerSeries != 0)
+    {
+        pMT->SetContainsPointers();
+
+        // Copy the pointer series map from the parent
+        CGCDesc::Init( (PVOID) pMT, bmtFP->NumGCPointerSeries );
+        if (bmtParent->NumParentPointerSeries != 0)
+        {
+            size_t ParentGCSize = CGCDesc::ComputeSize(bmtParent->NumParentPointerSeries);
+            memcpy( (PVOID) (((BYTE*) pMT) - ParentGCSize),
+                    (PVOID) (((BYTE*) GetParentMethodTable()) - ParentGCSize),
+                    ParentGCSize - sizeof(size_t)   // sizeof(size_t) is the NumSeries count
+                  );
+        }
+
+        UINT32 dwInstanceSliceOffset = AlignUp(HasParent() ? GetParentMethodTable()->GetNumInstanceFieldBytes() : 0, TARGET_POINTER_SIZE);
+
+        // Build the pointer series map for this pointers in this instance
+        CGCDescSeries *pSeries = ((CGCDesc*)pMT)->GetLowestSeries();
+        for (UINT i=0; i < bmtGCSeries->numSeries; i++) {
+            // See gcdesc.h for an explanation of why we adjust by subtracting BaseSize
+            BAD_FORMAT_NOTHROW_ASSERT(pSeries <= CGCDesc::GetCGCDescFromMT(pMT)->GetHighestSeries());
+
+            pSeries->SetSeriesSize( (size_t) bmtGCSeries->pSeries[i].len - (size_t) pMT->GetBaseSize() );
+            pSeries->SetSeriesOffset(bmtGCSeries->pSeries[i].offset + OBJECT_SIZE + dwInstanceSliceOffset);
+            pSeries++;
+        }
+
+        // Adjust the inherited series - since the base size has increased by "# new field instance bytes", we need to
+        // subtract that from all the series (since the series always has BaseSize subtracted for it - see gcdesc.h)
+        CGCDescSeries *pHighest = CGCDesc::GetCGCDescFromMT(pMT)->GetHighestSeries();
+        while (pSeries <= pHighest)
+        {
+            CONSISTENCY_CHECK(CheckPointer(GetParentMethodTable()));
+            pSeries->SetSeriesSize( pSeries->GetSeriesSize() - ((size_t) pMT->GetBaseSize() - (size_t) GetParentMethodTable()->GetBaseSize()) );
+            pSeries++;
+        }
+    }
+    
+    if(shouldDebug)
+    {
+        auto numSeries = CGCDesc::GetCGCDescFromMT(pMT)->GetNumSeries();
+        auto pSeries1 = CGCDesc::GetCGCDescFromMT(pMT)->GetLowestSeries();
+        auto pHighest1 = CGCDesc::GetCGCDescFromMT(pMT)->GetHighestSeries();
+
+        if(numSeries > 0){
+            printf("Full dump: %s.%s (gc fields %d (%d)) baseSize: %d\n", pszDebugNamespace, pszDebugName, (int)bmtFP->NumInstanceGCPointerFields, (int)bmtFP->NumInstanceGCPointerFields * TARGET_POINTER_SIZE, pMT->GetBaseSize());
+
+            DWORD serie = 0;
+            while(pSeries1 <= pHighest1){
+                printf("%d offs: %d, size: %d\n", serie, (int)pSeries1->GetSeriesOffset(), (int)pSeries1->GetSeriesSize());
+                serie++;
+                pSeries1++;
+            }
+
+            printf("\n");
+        }
+    }
+
+    delete [] bmtGCSeries->pSeries;
+    bmtGCSeries->pSeries = NULL;
+} // MethodTableBuilder::HandleGCForSequentialLayout
 
 static
 BOOL
@@ -11571,134 +11814,174 @@ VOID MethodTableBuilder::HandleGCForValueClasses(MethodTable ** pByValueClassCac
     EEClass *pClass = GetHalfBakedClass();
     MethodTable *pMT = GetHalfBakedMethodTable();
 
+    LPCUTF8 pszDebugName,pszDebugNamespace;
+    if (FAILED(bmtInternal->pModule->GetMDImport()->GetNameOfTypeDef(bmtInternal->pType->GetTypeDefToken(), &pszDebugName, &pszDebugNamespace)))
+        pszDebugName = pszDebugNamespace = "Invalid TypeDef record";
+
+    BOOL shouldDebug = TRUE;//strcmp(pszDebugNamespace, "UnityEngine") == 0;
+
     FieldDesc *pFieldDescList = pClass->GetFieldDescList();
 
     // Note that for value classes, the following calculation is only appropriate
     // when the instance is in its "boxed" state.
-    if (bmtFP->NumGCPointerSeries != 0)
+    if (bmtFP->NumGCPointerSeries == 0)
+        return;
+
+    CGCDescSeries *pSeries;
+    CGCDescSeries *pHighest;
+
+    pMT->SetContainsPointers();
+
+    CGCDesc::Init( (PVOID) pMT, bmtFP->NumGCPointerSeries );
+
+    // special case when all instance fields are objects - we can encode that as one serie.
+    if (bmtFP->fIsAllGCPointers)
     {
-        CGCDescSeries *pSeries;
-        CGCDescSeries *pHighest;
+        _ASSERTE(bmtFP->NumGCPointerSeries == 1);
 
-        pMT->SetContainsPointers();
+        CGCDescSeries* pSeries = CGCDesc::GetCGCDescFromMT(pMT)->GetHighestSeries();
 
-        CGCDesc::Init( (PVOID) pMT, bmtFP->NumGCPointerSeries );
+        // the data is right after the method table ptr
+        int offsetToData = TARGET_POINTER_SIZE;
 
-        // special case when all instance fields are objects - we can encode that as one serie.
-        if (bmtFP->fIsAllGCPointers)
-        {
-            _ASSERTE(bmtFP->NumGCPointerSeries == 1);
+        // Set the size as the negative of the BaseSize (the GC always adds the total
+        // size of the object, so what you end up with is the size of the data portion of the instance)
+        pSeries->SetSeriesSize(-(SSIZE_T)(offsetToData + TARGET_POINTER_SIZE));
+        pSeries->SetSeriesOffset(offsetToData);
 
-            CGCDescSeries* pSeries = CGCDesc::GetCGCDescFromMT(pMT)->GetHighestSeries();
-
-            // the data is right after the method table ptr
-            int offsetToData = TARGET_POINTER_SIZE;
-
-            // Set the size as the negative of the BaseSize (the GC always adds the total
-            // size of the object, so what you end up with is the size of the data portion of the instance)
-            pSeries->SetSeriesSize(-(SSIZE_T)(offsetToData + TARGET_POINTER_SIZE));
-            pSeries->SetSeriesOffset(offsetToData);
-
-            return;
+        if(shouldDebug){
+            printf("Full dump: %s.%s (gc fields %d (%d)) baseSize: %d\n", pszDebugNamespace, pszDebugName, (int)bmtFP->NumInstanceGCPointerFields, (int)bmtFP->NumInstanceGCPointerFields * TARGET_POINTER_SIZE, pMT->GetBaseSize());
+            printf("%d offs: %d, size: %d\n", 0, (int)pSeries->GetSeriesOffset(), (int)pSeries->GetSeriesSize());
         }
-
-        // Copy the pointer series map from the parent
-        if (bmtParent->NumParentPointerSeries != 0)
-        {
-            size_t ParentGCSize = CGCDesc::ComputeSize(bmtParent->NumParentPointerSeries);
-            memcpy( (PVOID) (((BYTE*) pMT) - ParentGCSize),
-                    (PVOID) (((BYTE*) GetParentMethodTable()) - ParentGCSize),
-                    ParentGCSize - sizeof(size_t)   // sizeof(size_t) is the NumSeries count
-                  );
-
-        }
-
-        DWORD repeat = 1;
-        if (bmtFP->NumInlineArrayElements > 1)
-        {
-            repeat = bmtFP->NumInlineArrayElements;
-        }
-
-        // Build the pointer series map for pointers in this instance
-        pSeries = ((CGCDesc*)pMT)->GetLowestSeries();
-        if (bmtFP->NumInstanceGCPointerFields)
-        {
-            // See gcdesc.h for an explanation of why we adjust by subtracting BaseSize
-            pSeries->SetSeriesSize((size_t)(bmtFP->NumInstanceGCPointerFields * repeat * TARGET_POINTER_SIZE) - (size_t)pMT->GetBaseSize());
-            pSeries->SetSeriesOffset(bmtFP->GCPointerFieldStart + OBJECT_SIZE);
-            pSeries++;
-        }
-
-        // Insert GC info for fields which are by-value classes
-        for (i = 0; i < bmtEnumFields->dwNumInstanceFields; i++)
-        {
-            if (pFieldDescList[i].IsByValue())
-            {
-                MethodTable* pByValueMT = pByValueClassCache[i];
-
-                if (pByValueMT->ContainsPointers())
-                {
-                    // Offset of the by value class in the class we are building, does NOT include Object
-                    DWORD       dwCurrentOffset = pFieldDescList[i].GetOffset();
-                    DWORD       dwElementSize = pByValueMT->GetBaseSize() - OBJECT_BASESIZE;
-
-                    // if we have an inline array, we will have only one formal instance field,
-                    // but will have to replicate the layout "repeat" times.
-                    for (DWORD r = 0; r < repeat; r++)
-                    {
-                        // The by value class may have more than one pointer series
-                        CGCDescSeries* pByValueSeries = CGCDesc::GetCGCDescFromMT(pByValueMT)->GetLowestSeries();
-                        SIZE_T dwNumByValueSeries = CGCDesc::GetCGCDescFromMT(pByValueMT)->GetNumSeries();
-
-                        for (SIZE_T j = 0; j < dwNumByValueSeries; j++)
-                        {
-                            size_t cbSeriesSize;
-                            size_t cbSeriesOffset;
-
-                            _ASSERTE(pSeries <= CGCDesc::GetCGCDescFromMT(pMT)->GetHighestSeries());
-
-                            cbSeriesSize = pByValueSeries->GetSeriesSize();
-
-                            // Add back the base size of the by value class, since it's being transplanted to this class
-                            cbSeriesSize += pByValueMT->GetBaseSize();
-
-                            // Subtract the base size of the class we're building
-                            cbSeriesSize -= pMT->GetBaseSize();
-
-                            // Set current series we're building
-                            pSeries->SetSeriesSize(cbSeriesSize);
-
-                            // Get offset into the value class of the first pointer field (includes a +Object)
-                            cbSeriesOffset = pByValueSeries->GetSeriesOffset();
-
-                            // Add element N offset
-                            cbSeriesOffset += r * dwElementSize;
-
-                            // Add it to the offset of the by value class in our class
-                            cbSeriesOffset += dwCurrentOffset;
-
-                            pSeries->SetSeriesOffset(cbSeriesOffset); // Offset of field
-                            pSeries++;
-                            pByValueSeries++;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Adjust the inherited series - since the base size has increased by "# new field instance bytes", we need to
-        // subtract that from all the series (since the series always has BaseSize subtracted for it - see gcdesc.h)
-        pHighest = CGCDesc::GetCGCDescFromMT(pMT)->GetHighestSeries();
-        while (pSeries <= pHighest)
-        {
-            CONSISTENCY_CHECK(CheckPointer(GetParentMethodTable()));
-            pSeries->SetSeriesSize( pSeries->GetSeriesSize() - ((size_t) pMT->GetBaseSize() - (size_t) GetParentMethodTable()->GetBaseSize()) );
-            pSeries++;
-        }
-
-        _ASSERTE(pSeries-1 <= CGCDesc::GetCGCDescFromMT(pMT)->GetHighestSeries());
+        
+        return;
     }
 
+    // Copy the pointer series map from the parent
+    if (bmtParent->NumParentPointerSeries != 0)
+    {
+        size_t ParentGCSize = CGCDesc::ComputeSize(bmtParent->NumParentPointerSeries);
+        memcpy( (PVOID) (((BYTE*) pMT) - ParentGCSize),
+                (PVOID) (((BYTE*) GetParentMethodTable()) - ParentGCSize),
+                ParentGCSize - sizeof(size_t)   // sizeof(size_t) is the NumSeries count
+                );
+
+    }
+
+    DWORD repeat = 1;
+    if (bmtFP->NumInlineArrayElements > 1)
+    {
+        repeat = bmtFP->NumInlineArrayElements;
+    }
+
+    // Build the pointer series map for pointers in this instance
+    pSeries = ((CGCDesc*)pMT)->GetLowestSeries();
+    int serie = 0;
+    
+    serie = 0;
+
+    if(bmtFP->NumInstanceGCPointerFields && (IsBlittable() || !IsManagedSequential())){
+        // See gcdesc.h for an explanation of why we adjust by subtracting BaseSize
+        pSeries->SetSeriesSize((size_t)(bmtFP->NumInstanceGCPointerFields * repeat * TARGET_POINTER_SIZE) - (size_t)pMT->GetBaseSize());
+        pSeries->SetSeriesOffset(bmtFP->GCPointerFieldStart + OBJECT_SIZE);
+        serie ++;
+        pSeries++;
+    }
+
+    /*
+    if (bmtFP->NumInstanceGCPointerFields)
+    {
+        // See gcdesc.h for an explanation of why we adjust by subtracting BaseSize
+        pSeries->SetSeriesSize((size_t)(bmtFP->NumInstanceGCPointerFields * repeat * TARGET_POINTER_SIZE) - (size_t)pMT->GetBaseSize());
+        pSeries->SetSeriesOffset(bmtFP->GCPointerFieldStart + OBJECT_SIZE);
+        serie ++;
+        pSeries++;
+    }
+    */
+
+    // Insert GC info for fields which are by-value classes
+    for (i = 0; i < bmtEnumFields->dwNumInstanceFields; i++)
+    {
+        if (!pFieldDescList[i].IsByValue())
+            continue;
+
+        MethodTable* pByValueMT = pByValueClassCache[i];
+
+        if (!pByValueMT->ContainsPointers())
+            continue;
+
+        // Offset of the by value class in the class we are building, does NOT include Object
+        DWORD       dwCurrentOffset = pFieldDescList[i].GetOffset();
+        DWORD       dwElementSize = pByValueMT->GetBaseSize() - OBJECT_BASESIZE;
+
+        // if we have an inline array, we will have only one formal instance field,
+        // but will have to replicate the layout "repeat" times.
+        for (DWORD r = 0; r < repeat; r++)
+        {
+            // The by value class may have more than one pointer series
+            CGCDescSeries* pByValueSeries = CGCDesc::GetCGCDescFromMT(pByValueMT)->GetLowestSeries();
+            SIZE_T dwNumByValueSeries = CGCDesc::GetCGCDescFromMT(pByValueMT)->GetNumSeries();
+
+            for (SIZE_T j = 0; j < dwNumByValueSeries; j++)
+            {
+                size_t cbSeriesSize;
+                size_t cbSeriesOffset;
+
+                _ASSERTE(pSeries <= CGCDesc::GetCGCDescFromMT(pMT)->GetHighestSeries());
+
+                cbSeriesSize = pByValueSeries->GetSeriesSize();
+
+                // Add back the base size of the by value class, since it's being transplanted to this class
+                cbSeriesSize += pByValueMT->GetBaseSize();
+
+                // Subtract the base size of the class we're building
+                cbSeriesSize -= pMT->GetBaseSize();
+
+                // Set current series we're building
+                pSeries->SetSeriesSize(cbSeriesSize);
+
+                // Get offset into the value class of the first pointer field (includes a +Object)
+                cbSeriesOffset = pByValueSeries->GetSeriesOffset();
+
+                // Add element N offset
+                cbSeriesOffset += r * dwElementSize;
+
+                // Add it to the offset of the by value class in our class
+                cbSeriesOffset += dwCurrentOffset;
+
+                pSeries->SetSeriesOffset(cbSeriesOffset); // Offset of field
+                pSeries++;
+                pByValueSeries++;
+            }
+        }
+    }
+    
+    // Adjust the inherited series - since the base size has increased by "# new field instance bytes", we need to
+    // subtract that from all the series (since the series always has BaseSize subtracted for it - see gcdesc.h)
+    pHighest = CGCDesc::GetCGCDescFromMT(pMT)->GetHighestSeries();
+    while (pSeries <= pHighest)
+    {
+        CONSISTENCY_CHECK(CheckPointer(GetParentMethodTable()));
+        pSeries->SetSeriesSize( pSeries->GetSeriesSize() - ((size_t) pMT->GetBaseSize() - (size_t) GetParentMethodTable()->GetBaseSize()) );
+        pSeries++;
+    }
+    
+    if(shouldDebug)
+    {
+        auto pSeries1 = CGCDesc::GetCGCDescFromMT(pMT)->GetLowestSeries();
+        auto pHighest1 = CGCDesc::GetCGCDescFromMT(pMT)->GetHighestSeries();
+
+        printf("Full dump: %s.%s (gc fields %d (%d)) baseSize: %d\n", pszDebugNamespace, pszDebugName, (int)bmtFP->NumInstanceGCPointerFields, (int)bmtFP->NumInstanceGCPointerFields * TARGET_POINTER_SIZE, pMT->GetBaseSize());
+
+        serie = 0;
+        while(pSeries1 <= pHighest1){
+            printf("%d offs: %d, size: %d\n", serie, (int)pSeries1->GetSeriesOffset(), (int)pSeries1->GetSeriesSize());
+            serie++;
+            pSeries1++;
+        }
+    }
+
+    _ASSERTE(pSeries-1 <= CGCDesc::GetCGCDescFromMT(pMT)->GetHighestSeries());
 }
 
 //*******************************************************************************
@@ -12172,7 +12455,7 @@ MethodTableBuilder::GatherGenericsInfo(
 //   *pPackingSize       declared packing size
 //   *pfExplicitoffsets  offsets explicit in metadata or computed?
 //=======================================================================
-BOOL HasLayoutMetadata(Assembly* pAssembly, IMDInternalImport* pInternalImport, mdTypeDef cl, MethodTable* pParentMT, BYTE* pPackingSize, BYTE* pNLTType, BOOL* pfExplicitOffsets)
+BOOL HasLayoutMetadata(Assembly* pAssembly, IMDInternalImport* pInternalImport, mdTypeDef cl, MethodTable* pParentMT, BYTE* pPackingSize, BYTE* pNLTType, BOOL* pfExplicitOffsets, BOOL* pfExplicitSequential)
 {
     CONTRACTL
     {
@@ -12183,6 +12466,7 @@ BOOL HasLayoutMetadata(Assembly* pAssembly, IMDInternalImport* pInternalImport, 
         PRECONDITION(CheckPointer(pPackingSize));
         PRECONDITION(CheckPointer(pNLTType));
         PRECONDITION(CheckPointer(pfExplicitOffsets));
+        PRECONDITION(CheckPointer(pfExplicitSequential));
     }
     CONTRACTL_END;
 
@@ -12193,6 +12477,8 @@ BOOL HasLayoutMetadata(Assembly* pAssembly, IMDInternalImport* pInternalImport, 
         pAssembly->ThrowTypeLoadException(pInternalImport, cl, IDS_CLASSLOAD_BADFORMAT);
     }
 
+    *pfExplicitSequential = FALSE;
+
     if (IsTdAutoLayout(clFlags))
     {
         return FALSE;
@@ -12200,6 +12486,7 @@ BOOL HasLayoutMetadata(Assembly* pAssembly, IMDInternalImport* pInternalImport, 
     else if (IsTdSequentialLayout(clFlags))
     {
         *pfExplicitOffsets = FALSE;
+        *pfExplicitSequential = TRUE;
     }
     else if (IsTdExplicitLayout(clFlags))
     {
@@ -12349,6 +12636,8 @@ ClassLoader::CreateTypeHandleForTypeDefThrowing(
 
     BYTE nstructPackingSize = 0, nstructNLT = 0;
     BOOL fExplicitOffsets = FALSE;
+    BOOL fExplicitSequential = FALSE;
+
     // NOTE: HasLayoutMetadata does not load classes
     BOOL fHasLayout =
         !genericsInfo.fContainsGenericVariables &&
@@ -12359,7 +12648,8 @@ ClassLoader::CreateTypeHandleForTypeDefThrowing(
             pParentMethodTable,
             &nstructPackingSize,
             &nstructNLT,
-            &fExplicitOffsets);
+            &fExplicitOffsets,
+            &fExplicitSequential);
 
     BOOL fIsEnum = ((g_pEnumClass != NULL) && (pParentMethodTable == g_pEnumClass));
 
@@ -12559,6 +12849,7 @@ ClassLoader::CreateTypeHandleForTypeDefThrowing(
                     nstructPackingSize,
                     nstructNLT,
                     fExplicitOffsets,
+                    fExplicitSequential,
                     pParentMethodTable,
                     cFields,
                     &hEnumField,

@@ -2102,6 +2102,7 @@ unsigned CEEInfo::getClassAlignmentRequirementStatic(TypeHandle clsHnd)
             // if it's the unmanaged view of the managed type, we always use the unmanaged alignment requirement
             result = pMT->GetNativeLayoutInfo()->GetLargestAlignmentRequirement();
         }
+        // FIXME: This will work with ALLOW_GC_FIELDS_IN_SEQUENTIAL because we don't apply auto-layout to them.
         else if (pInfo->IsManagedSequential() || pInfo->IsBlittable())
         {
             _ASSERTE(!pMT->ContainsPointers());

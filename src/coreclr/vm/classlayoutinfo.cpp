@@ -314,6 +314,27 @@ namespace
         }
         return TRUE;
     }
+    
+    BOOL TypeIsSequential(CorElementType corElemType, TypeHandle pNestedType)
+    {
+        if (CorTypeInfo::IsPrimitiveType(corElemType) || corElemType == ELEMENT_TYPE_PTR || corElemType == ELEMENT_TYPE_FNPTR)
+        {
+            return TRUE;
+        }
+
+        if (corElemType == ELEMENT_TYPE_VALUETYPE)
+        {
+            _ASSERTE(!pNestedType.IsNull());
+
+            if(corElemType == ELEMENT_TYPE_VALUETYPE && pNestedType.IsEnum()){
+                return TRUE;
+            }
+
+            return pNestedType.GetMethodTable()->GetClass()->HasSequentialLayout();
+        }
+
+        return FALSE;
+    }
 
     BOOL TypeHasAutoLayoutField(CorElementType corElemType, TypeHandle pNestedType)
     {
@@ -464,6 +485,7 @@ namespace
         mdTypeDef cl,
         ParseNativeTypeFlags nativeTypeFlags,
         const SigTypeContext* pTypeContext,
+        BOOL fExplicitSequential,
         BOOL* fDisqualifyFromManagedSequential,
         BOOL* fHasAutoLayoutField,
         BOOL* fHasInt128Field,
@@ -570,7 +592,14 @@ namespace
                 }
 
                 pFieldInfoArrayOut->m_placement = GetFieldPlacementInfo(corElemType, typeHandleMaybe);
-                *fDisqualifyFromManagedSequential |= TypeHasGCPointers(corElemType, typeHandleMaybe);
+                
+                #if !defined(ALLOW_GC_FIELDS_IN_SEQUENTIAL)
+                    *fDisqualifyFromManagedSequential |= TypeHasGCPointers(corElemType, typeHandleMaybe);
+                #elif !defined(ALLOW_GC_FIELDS_IN_AUTO)
+                    if(!fExplicitSequential && TypeHasGCPointers(corElemType, typeHandleMaybe))
+                        *fDisqualifyFromManagedSequential |= TRUE;
+                #endif
+
                 *fHasAutoLayoutField |= TypeHasAutoLayoutField(corElemType, typeHandleMaybe);
                 *fHasInt128Field |= TypeHasInt128Field(corElemType, typeHandleMaybe);
 
@@ -629,6 +658,7 @@ VOID EEClassLayoutInfo::CollectLayoutFieldMetadataThrowing(
    BYTE           packingSize,      // packing size (from @dll.struct)
    BYTE           nlType,           // nltype (from @dll.struct)
    BOOL           fExplicitOffsets, // explicit offsets?
+   BOOL           fExplicitSequential, // user defined class/struct as Sequential
    MethodTable   *pParentMT,        // the loaded superclass
    ULONG          cTotalFields,         // total number of fields (instance and static)
    HENUMInternal *phEnumField,      // enumerator for field
@@ -736,6 +766,7 @@ VOID EEClassLayoutInfo::CollectLayoutFieldMetadataThrowing(
         cl,
         nativeTypeFlags,
         pTypeContext,
+        fExplicitSequential,
         &fDisqualifyFromManagedSequential,
         &hasAutoLayoutField,
         &hasInt128Field,

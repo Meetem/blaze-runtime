@@ -1994,7 +1994,7 @@ private:
         DWORD FirstInstanceFieldOfSize[MAX_LOG2_PRIMITIVE_FIELD_SIZE+1];
         DWORD GCPointerFieldStart;
         DWORD NumInstanceGCPointerFields;   // does not include inherited pointer fields
-        DWORD NumGCPointerSeries;
+        DWORD NumGCPointerSeries; // does include inherited series count
         DWORD NumInstanceFieldBytes;
         DWORD NumInlineArrayElements;
 
@@ -2829,6 +2829,10 @@ private:
     VOID
     PlaceInstanceFields(
         MethodTable **);
+    
+    VOID
+    PlaceInstanceFieldsSequential(
+        MethodTable **);
 
     BOOL
     CheckForVtsEventMethod(
@@ -2898,6 +2902,7 @@ private:
         bmtFieldLayoutTag* pFieldLayout);
 
     VOID    HandleGCForExplicitLayout();
+    VOID    HandleGCForSequentialLayout(MethodTable ** pByValueClassCache);
 
     VOID    CheckForHFA(MethodTable ** pByValueClassCache);
 
